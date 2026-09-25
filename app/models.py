@@ -92,6 +92,41 @@ class ItemAnalysisOut(BaseModel):
     )
 
 
+class ItemCalibrationOut(BaseModel):
+    """Prediction-probability calibration of one item, from finished sessions."""
+
+    item_id: str = Field(..., description="被校准的题目 ID")
+    sample_count: int = Field(
+        ..., description="样本数：已结束（finished）会话中该题的作答条数"
+    )
+    actual_correct_rate: float | None = Field(
+        None,
+        description=(
+            "实际正确率：作答时保存的 score 之和 / 样本数；无历史样本时为 null"
+        ),
+    )
+    mean_predicted_probability: float | None = Field(
+        None,
+        description=(
+            "平均预测正确率：作答前保存的 p_correct 之和 / 样本数；"
+            "无历史样本时为 null"
+        ),
+    )
+    z_score: float | None = Field(
+        None,
+        description=(
+            "标准化偏差 z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]；"
+            "样本少于 30 或分母为零时为 null"
+        ),
+    )
+    deviation_flag: bool | None = Field(
+        None,
+        description=(
+            "系统性偏离标记：|z|≥1.96 时为 true；样本少于 30 或分母为零时为 null"
+        ),
+    )
+
+
 # ---- item bulk import ------------------------------------------------------
 
 class ItemImportRequest(BaseModel):

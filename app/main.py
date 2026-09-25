@@ -34,6 +34,12 @@ every other finished session for answer-sheet plagiarism: sheets are aligned
 by ``item_id``, only shared *wrong* options count as matches, and each match
 is weighted by how rare that wrong option is across finished sessions.
 
+``GET /api/items/{id}/calibration`` aggregates the item's responses from
+finished sessions and compares the ``p_correct``/``score`` values frozen at
+answer time: sample count, actual correct rate, mean predicted probability
+and a standardised deviation ``z`` flag systematic miscalibration of the 2PL
+parameters without ever recomputing them.
+
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
 cannot be lost to read/write races.
@@ -57,6 +63,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from . import irt
 from .analysis import analyze_item
+from .calibration import calibrate_item
 from .database import get_db, init_db
 from .importer import NormalizedItem, RowError, validate_rows
 from .models import (
@@ -65,6 +72,7 @@ from .models import (
     ItemAnalysisOut,
     ItemAvailabilityUpdate,
     ItemBankOut,
+    ItemCalibrationOut,
     ItemDetailOut,
     ItemImportErrorOut,
     ItemImportRequest,
@@ -92,9 +100,10 @@ app = FastAPI(
         "单次 Newton 更新估计能力，信息量最大选题，全局曝光上限控制；"
         "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）；"
         "题目可撤回/启用，撤回题不再参与新取题；"
-        "已结束会话支持答卷雷同复核（同错选项加权相似度）。"
+        "已结束会话支持答卷雷同复核（同错选项加权相似度）；"
+        "单题预测概率校准发现 2PL 参数与实际得分的系统性偏离。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -533,6 +542,45 @@ def item_analysis(
         sample_count=result.sample_count,
         correct_rate=result.correct_rate,
         pearson_correlation=result.pearson_r,
+    )
+
+
+@app.get(
+    "/api/items/{item_id}/calibration",
+    response_model=ItemCalibrationOut,
+    tags=["items"],
+)
+def item_calibration(
+    item_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ItemCalibrationOut:
+    """Check one item's 2PL predictions against observed outcomes.
+
+    Strictly read-only: no session, exposure or bank row is touched.  Every
+    response written by a *finished* session for this item contributes one
+    sample of (``p_correct`` predicted before the answer was known, ``score``
+    observed); both numbers are the values frozen into ``responses`` at
+    answer time, so neither the current ability estimates nor later edits of
+    the item's parameters can change the result.  Returns the sample count,
+    the actual correct rate, the mean predicted probability and the
+    standardised deviation
+    ``z = (Σscore − Σp_correct) / √Σ[p_correct(1−p_correct)]``; ``z`` and
+    the ``|z| ≥ 1.96`` deviation flag are ``null`` with fewer than 30 samples
+    or a zero denominator, the rates are ``null`` with no samples at all, and
+    an unknown item gets a 404.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    result = calibrate_item(conn, item_id)
+    return ItemCalibrationOut(
+        item_id=item_id,
+        sample_count=result.sample_count,
+        actual_correct_rate=result.actual_correct_rate,
+        mean_predicted_probability=result.mean_predicted_probability,
+        z_score=result.z_score,
+        deviation_flag=result.deviation_flag,
     )
 
 
