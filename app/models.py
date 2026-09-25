@@ -92,6 +92,42 @@ class ItemAnalysisOut(BaseModel):
     )
 
 
+class ItemCalibrationOut(BaseModel):
+    """Calibration of the stored 2PL predictions against the observed scores."""
+
+    item_id: str = Field(..., description="被校准评估的题目 ID")
+    sample_count: int = Field(
+        ..., description="有效样本数：已结束（finished）会话中该题的作答条数"
+    )
+    actual_correct_rate: float | None = Field(
+        None,
+        description=(
+            "实际正确率（Σscore/样本数，score 为作答时冻结值）；无样本时为 null"
+        ),
+    )
+    mean_predicted_correct_rate: float | None = Field(
+        None,
+        description=(
+            "平均预测正确率（Σp_correct/样本数，p_correct 为作答前保存的 2PL 概率）；"
+            "无样本时为 null"
+        ),
+    )
+    z_score: float | None = Field(
+        None,
+        description=(
+            "标准化偏差 z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]；"
+            "样本少于 30 或分母为零时为 null"
+        ),
+    )
+    deviation_flag: bool | None = Field(
+        None,
+        description=(
+            "预测与实际是否存在系统性偏离（|z|≥1.96 时 true）；"
+            "z_score 为 null 时同为 null"
+        ),
+    )
+
+
 # ---- item bulk import ------------------------------------------------------
 
 class ItemImportRequest(BaseModel):

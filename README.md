@@ -15,6 +15,7 @@
 - 支持**题目撤回 / 启用** `PATCH /api/items/{id}/availability`：撤回题不再参与新取题；会话挂起题被撤回后，再次 `/next` 在同一事务内清除挂起项并按既有规则重选（已计曝光不回退）；对撤回题提交新作答返回 `409`（不写答题记录、不更新能力），已保存的 `response_id` 重放仍返回首次结果；
 - 提供**单题质量复盘** `GET /api/items/{id}/analysis`：只统计**已结束会话**的历史作答，并使用作答时冻结保存的 `score`（之后修改题目答案不影响复盘结果）；对每个答过目标题且同场至少另答一题的会话，以「目标题得分 + 同场其余题答对比例」组成样本，返回有效样本数、历史正确率及两者的 Pearson 相关系数（样本少于 5 或任一序列无方差时为 `null`；未知题目 `404`；接口只读）；
 - 提供**答卷雷同复核** `GET /api/sessions/{id}/similarity`：面向**已结束会话**，按 `item_id` 对齐双方历史作答，仅「双方选择同一错误选项」计为同错匹配（正确作答不计），每个匹配按该错误选项在全体已结束会话中的稀有程度加权（`log((该题错误作答总数+2)/(选择该错误选项的次数+1))`），分数为权重之和除以共答题数；候选至少共答 `min_shared` 题（默认 4），按分数、同错数降序及会话 ID 升序返回前 `limit` 条；统计只读 `responses` 中冻结的 `score` 与 `response`，题库改答案后结果不变；
+- 提供**单题预测概率校准** `GET /api/items/{id}/calibration`：只统计**已结束会话**中该题的历史作答，使用作答时保存的作答前 `p_correct` 与冻结 `score`（**不**按当前能力值或改动后的题目参数重算），返回样本数、实际正确率、平均预测正确率与标准化偏差 `z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]`；样本少于 30 或分母为零时 `z` 与偏离标记为 `null`，其余按 `|z|≥1.96` 给出偏离标记（未知题目 `404`，无历史样本时比率为 `null`，接口只读）；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -22,9 +23,10 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 雷同复核
+│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 雷同复核 / 概率校准
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
 │   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
+│   ├── calibration.py # 单题预测概率校准：p_correct 与实际得分的标准化偏差
 │   ├── similarity.py  # 答卷雷同复核：同错选项加权相似度（已结束会话）
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
 │   ├── database.py    # SQLite 连接、建表、初始化
@@ -340,6 +342,47 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 // {"item_id":"ITEM-002","sample_count":3,"correct_rate":1.0,"pearson_correlation":null}
 ```
 
+### 单题预测概率校准（`GET /api/items/{id}/calibration`）
+
+只读地检查单题的 **2PL 预测概率与实际得分是否系统性偏离**，帮助题库维护者发现
+标定不准（难度/区分度失真）的题目：
+
+- **样本来源**：仅统计状态为 `finished` 的**已结束会话**中该题的作答记录；
+  进行中/暂停中的会话不计入。每条作答记录贡献一个样本。
+- **使用作答时保存的数值**：每个样本取 `responses` 里作答前算好并保存的
+  `p_correct`（2PL 答对概率）与冻结的 `score`（1 对 / 0 错），**不**按当前能力值
+  或改动后的题目参数重算——之后通过批量导入修改该题难度/区分度/答案，都不会
+  改变校准结果。
+- **返回字段**：
+  - `sample_count`：有效样本数；
+  - `actual_correct_rate`：实际正确率 `Σscore/n`（无样本时为 `null`）；
+  - `mean_predicted_correct_rate`：平均预测正确率 `Σp_correct/n`（无样本时为 `null`）；
+  - `z_score`：标准化偏差 `z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]`
+    （各次作答近似独立 Bernoulli(p_correct) 的正态近似）；**样本少于 30 或分母
+    为零时返回 `null`**；
+  - `deviation_flag`：是否存在系统性偏离——`|z|≥1.96`（双侧 5% 临界值）时为
+    `true`，`z_score` 为 `null` 时同为 `null`。`z>0` 表示实际答对多于预测
+    （该题被低估，偏易），`z<0` 表示实际答对少于预测（该题被高估，偏难）。
+- 接口完全只读：不创建/结束会话、不改变曝光计数、不写题库。
+- 未知题目返回 **HTTP 404**。
+
+```jsonc
+// GET /api/items/ITEM-001/calibration
+{
+  "item_id": "ITEM-001",
+  "sample_count": 42,
+  "actual_correct_rate": 0.7619047619047619,
+  "mean_predicted_correct_rate": 0.5831228904710254,
+  "z_score": 2.5012,
+  "deviation_flag": true        // 实际正确率显著高于预测：该题可能比标定偏易
+}
+// 样本少于 30 或分母为零：
+// {"item_id":"ITEM-002","sample_count":12,"actual_correct_rate":0.75,
+//  "mean_predicted_correct_rate":0.71,"z_score":null,"deviation_flag":null}
+// 无历史样本：{"item_id":"ITEM-003","sample_count":0,"actual_correct_rate":null,
+//  "mean_predicted_correct_rate":null,"z_score":null,"deviation_flag":null}
+```
+
 ### 答卷雷同复核（`GET /api/sessions/{id}/similarity`）
 
 只读地复核一份**已结束**答卷与其他已结束会话的雷同程度，用于发现抄袭/串通作答：
@@ -394,6 +437,7 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | GET  | `/api/items/{item_id}` | 单题详情（管理用，含正确答案与启用状态） |
 | PATCH | `/api/items/{item_id}/availability` | **撤回 / 启用题目**（`{"is_active": bool}`；未知题目 404；撤回题不参与新取题） |
 | GET  | `/api/items/{item_id}/analysis` | **单题质量复盘**（已结束会话样本、历史正确率、与同场表现的 Pearson 相关系数；只读） |
+| GET  | `/api/items/{item_id}/calibration` | **单题预测概率校准**（已结束会话样本、实际/平均预测正确率、标准化偏差 z 与偏离标记；只读） |
 | POST | `/api/items/import` | **题库批量导入/预检**（逐行错误、dry_run、事务原子 upsert、更新保留曝光数与启用状态） |
 | POST | `/api/sessions` | 创建测验会话 |
 | GET  | `/api/sessions/{id}` | 会话状态 |
@@ -570,6 +614,14 @@ curl -s http://localhost:8000/api/items/ITEM-001/analysis
 # 样本少于 5 或任一序列无方差 -> "pearson_correlation":null
 # 未知题目 -> HTTP 404 {"detail":"item not found"}
 
+# 7b) 单题预测概率校准（只读；用作答前保存的 p_correct 对比冻结的 score）
+curl -s http://localhost:8000/api/items/ITEM-001/calibration
+# {"item_id":"ITEM-001","sample_count":42,"actual_correct_rate":0.7619,
+#  "mean_predicted_correct_rate":0.5831,"z_score":2.5012,"deviation_flag":true}
+# deviation_flag=true 表示 |z|>=1.96，预测与实际存在系统性偏离
+# 样本少于 30 或分母为零 -> "z_score":null,"deviation_flag":null
+# 无历史样本 -> 两个比率为 null；未知题目 -> HTTP 404
+
 # 8) 答卷雷同复核（只读；目标会话须已结束）
 #    min_shared：候选至少共答的题数（默认 4，2~50）；limit：返回条数上限（默认 20，1~50）
 curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=20"
@@ -594,4 +646,5 @@ curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=2
 - 暂停/恢复**无需额外配置**：状态与冻结秒数随会话存放在同一 SQLite 库；服务启动时旧库自动迁移（新增 `paused_at` / `remaining_seconds` 列，并把 `status` 的 CHECK 放宽到 `active/paused/finished`），历史会话与答题记录原样保留。所有时间戳均为 **UTC**、秒级精度，因此暂停冻结与恢复重算的截止时间最多有 ±1 秒的取整误差。
 - 题目撤回**无需额外配置**：旧库启动时自动为 `items` 表新增 `is_active` 列（`DEFAULT 1`），**既有题目全部迁移为启用**；撤回只影响新取题与新的作答，历史答题记录、曝光计数与单题复盘统计均不受影响。
 - 答卷雷同复核**无需额外配置**：不新增任何表，直接复用现有 `sessions`/`responses`；只统计 `finished` 会话，且只读作答时冻结的 `score` 与 `response`——题库改答案、题目撤回都不影响复核结果；接口完全只读，可安全地对历史会话随时调用。
+- 单题预测概率校准**无需额外配置**：同样只读 `responses` 中作答前保存的 `p_correct` 与冻结的 `score`，不按当前能力值或改动后的题目参数重算；只统计 `finished` 会话，接口完全只读。
 - SQLite + WAL 适合单机/演示与中小流量；写事务已串行化（暂停/恢复同样使用 `BEGIN IMMEDIATE`），水平扩展时可替换连接层。
